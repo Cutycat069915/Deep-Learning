@@ -7,18 +7,44 @@ from tensorflow.keras import layers, models
 from mtcnn import MTCNN
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-from keras_facenet import FaceNet
 
 # 全局配置
-INPUT_SHAPE = (220, 220, 3)
+INPUT_SHAPE = (160, 160, 3)
 EMBEDDING_DIM = 128
 BATCH_SIZE = 32
 EPOCHS = 50
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.001
 
-# 初始化MTCNN檢測器和FaceNet
+# 初始化MTCNN檢測器
 detector = MTCNN()
-facenet_model = FaceNet()
+
+
+def align_face(img, keypoints):
+    """對齊人臉"""
+    left_eye = keypoints['left_eye']
+    right_eye = keypoints['right_eye']
+
+    # 計算眼睛中心和角度
+    dY = right_eye[1] - left_eye[1]
+    dX = right_eye[0] - left_eye[0]
+    angle = np.degrees(np.arctan2(dY, dX))
+
+    # 計算眼睛中心點
+    eyes_center = (
+        (left_eye[0] + right_eye[0]) // 2,
+        (left_eye[1] + right_eye[1]) // 2
+    )
+
+    # 旋轉矩陣
+    M = cv2.getRotationMatrix2D(eyes_center, angle, scale=1.0)
+    aligned_img = cv2.warpAffine(
+        img,
+        M,
+        (img.shape[1], img.shape[0]),
+        flags=cv2.INTER_CUBIC
+    )
+
+    return aligned_img
 
 
 def preprocess_image(image_path):
@@ -39,13 +65,17 @@ def preprocess_image(image_path):
 
         # 獲取第一個人臉
         face = faces[0]
-        x, y, width, height = face['box']
+        keypoints = face['keypoints']
+
+        # 對齊人臉
+        aligned_face = align_face(img, keypoints)
 
         # 裁剪人臉區域
-        face_img = img_rgb[y:y + height, x:x + width]
+        x, y, width, height = face['box']
+        face_img = aligned_face[y:y + height, x:x + width]
 
         # 調整大小
-        face_resized = cv2.resize(face_img, (220, 220))
+        face_resized = cv2.resize(face_img, (160, 160))
 
         # 歸一化
         face_normalized = face_resized.astype(np.float32) / 255.0
@@ -106,27 +136,44 @@ def generate_triplets(data_folder):
     return np.array(triplets)
 
 
-def create_refined_embedding_model():
-    """基於預訓練FaceNet創建精細化嵌入模型"""
-    # 加載預訓練FaceNet模型
-    base_model = facenet_model.model
+def create_embedding_model():
+    """創建嵌入模型"""
+    model = models.Sequential([
+        # 第一個卷積塊
+        layers.Conv2D(32, (3, 3), activation='relu', padding='same',
+                      input_shape=INPUT_SHAPE),
+        layers.BatchNormalization(),
+        layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D(2, 2),
+        layers.Dropout(0.25),
 
-    # 凍結大部分原始層
-    for layer in base_model.layers[:-3]:
-        layer.trainable = False
+        # 第二個卷積塊
+        layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D(2, 2),
+        layers.Dropout(0.25),
 
-    # 添加微調層
-    x = base_model.layers[-3].output
-    x = layers.Dense(512, activation='relu', name='fine_tune_dense1')(x)
-    x = layers.BatchNormalization(name='fine_tune_bn1')(x)
-    x = layers.Dropout(0.5, name='fine_tune_dropout')(x)
-    x = layers.Dense(EMBEDDING_DIM, name='fine_tune_embedding')(x)
-    x = layers.Lambda(lambda x: tf.math.l2_normalize(x, axis=1),
-                      name='l2_normalize')(x)
+        # 第三個卷積塊
+        layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D(2, 2),
+        layers.Dropout(0.25),
 
-    refined_model = models.Model(inputs=base_model.input, outputs=x)
+        # 全連接層
+        layers.Flatten(),
+        layers.Dense(512, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.5),
+        layers.Dense(EMBEDDING_DIM),
+        layers.Lambda(lambda x: tf.math.l2_normalize(x, axis=1))
+    ])
 
-    return refined_model
+    return model
 
 
 def create_triplet_model(embedding_model):
@@ -159,11 +206,11 @@ def create_triplet_model(embedding_model):
 
 def triplet_loss(y_true, y_pred, alpha=0.2):
     """三元組損失函數"""
-    total_length = y_pred.shape.as_list()[-1]
+    total_lenght = y_pred.shape.as_list()[-1]
 
-    anchor = y_pred[:, 0:int(total_length * 1 / 3)]
-    positive = y_pred[:, int(total_length * 1 / 3):int(total_length * 2 / 3)]
-    negative = y_pred[:, int(total_length * 2 / 3):int(total_length)]
+    anchor = y_pred[:, 0:int(total_lenght * 1 / 3)]
+    positive = y_pred[:, int(total_lenght * 1 / 3):int(total_lenght * 2 / 3)]
+    negative = y_pred[:, int(total_lenght * 2 / 3):int(total_lenght)]
 
     # 計算距離
     pos_dist = tf.reduce_sum(tf.square(anchor - positive), axis=1)
@@ -179,6 +226,7 @@ def train_model(data_folder, save_dir='models'):
     """訓練模型的主函數"""
     print("開始生成訓練數據...")
     triplets = generate_triplets(data_folder)
+    print(f"產生 {len(triplets)} 個數據")
 
     # 分離數據
     anchors = triplets[:, 0]
@@ -197,7 +245,7 @@ def train_model(data_folder, save_dir='models'):
     )
 
     # 創建模型
-    embedding_model = create_refined_embedding_model()
+    embedding_model = create_embedding_model()
     triplet_model = create_triplet_model(embedding_model)
 
     # 編譯模型
@@ -210,7 +258,7 @@ def train_model(data_folder, save_dir='models'):
     os.makedirs(save_dir, exist_ok=True)
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            os.path.join(save_dir, 'best_refined_model.h5'),
+            os.path.join(save_dir, 'best_model.h5'),
             save_best_only=True,
             monitor='val_loss'
         ),
@@ -248,7 +296,7 @@ def train_model(data_folder, save_dir='models'):
     )
 
     # 保存模型
-    embedding_model.save(os.path.join(save_dir, 'refined_embedding_model.h5'))
+    embedding_model.save(os.path.join(save_dir, 'embedding_model.h5'))
 
     # 繪製訓練歷史
     plt.figure(figsize=(12, 4))
@@ -308,7 +356,7 @@ if __name__ == "__main__":
 
         # 測試模型
         test_image1 = "D:/Desktop/Pic/data/anchor05.jpg"
-        test_image2 = "D:/Desktop/Pic/data/anchor07.jpg"
+        test_image2 = "D:/Desktop/Pic/data/negative04.jpg"
 
         similarity = compare_faces(test_image1, test_image2, embedding_model)
         if similarity is not None:
@@ -317,5 +365,3 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"發生錯誤: {str(e)}")
-
-
