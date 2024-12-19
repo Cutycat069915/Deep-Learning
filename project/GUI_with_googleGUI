@@ -1,0 +1,378 @@
+import customtkinter as ctk
+from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox
+from tkinter.ttk import Progressbar, Treeview
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import os
+import io
+import tempfile
+
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+TOKEN_PATH = "token.json"
+CREDENTIALS_PATH = "credentials.json"
+
+
+class FaceRecognitionApp:
+    def __init__(self, root, face_db):
+        # 設定 CustomTkinter 主題和外觀
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        # 視窗設定
+        self.root = root
+        self.root.title("人臉辨識系統")
+        self.root.geometry("900x700")  # 加寬視窗以容納檔案列表
+
+        # 字型設定
+        self.myfont = ("Helvetica", 14)
+
+        # Google Drive 服務
+        self.drive_service = None
+
+        # 主要框架分割
+        self.main_frame = ctk.CTkFrame(root)
+        self.main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # 左側 - 圖片顯示區域
+        self.left_frame = ctk.CTkFrame(self.main_frame)
+        self.left_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        # 右側 - Google Drive 檔案列表
+        self.right_frame = ctk.CTkFrame(self.main_frame)
+        self.right_frame.pack(side="right", fill="both", padx=5)
+
+        # 左側內容
+        # 標題 Label
+        self.label = ctk.CTkLabel(
+            self.left_frame,
+            text="上傳圖片以進行辨識",
+            font=self.myfont
+        )
+        self.label.pack(pady=10)
+
+        # 圖片顯示 Label
+        self.image_label = ctk.CTkLabel(
+            self.left_frame,
+            text="(上傳圖片會顯示在此處)",
+            width=400,
+            height=300,
+            fg_color="gray",
+            font=self.myfont
+        )
+        self.image_label.pack(pady=10)
+
+        # 本地按鈕區域
+        self.local_button_frame = ctk.CTkFrame(self.left_frame)
+        self.local_button_frame.pack(pady=10)
+
+        # 上傳按鈕
+        self.upload_button = ctk.CTkButton(
+            master=self.local_button_frame,
+            text="選擇本地照片",
+            command=self.upload_image,
+            font=self.myfont
+        )
+        self.upload_button.pack(side="left", padx=10)
+
+        # 重選按鈕
+        self.reset_button = ctk.CTkButton(
+            master=self.local_button_frame,
+            text="重選",
+            command=self.reset,
+            font=self.myfont
+        )
+        self.reset_button.pack(side="left", padx=10)
+
+        # Google Drive 按鈕區域
+        self.drive_frame = ctk.CTkFrame(self.left_frame)
+        self.drive_frame.pack(pady=10)
+
+        # 連接 Google Drive 按鈕
+        self.connect_drive_button = ctk.CTkButton(
+            master=self.drive_frame,
+            text="連接 Google Drive",
+            command=self.connect_to_drive,
+            font=self.myfont
+        )
+        self.connect_drive_button.pack(side="left", padx=10)
+
+        # 上傳至 Google Drive 按鈕
+        self.upload_drive_button = ctk.CTkButton(
+            master=self.drive_frame,
+            text="上傳至 Google Drive",
+            command=self.upload_to_drive,
+            state="disabled",
+            font=self.myfont
+        )
+        self.upload_drive_button.pack(side="left", padx=10)
+
+        # 右側內容 - Google Drive 檔案列表
+        self.files_label = ctk.CTkLabel(
+            self.right_frame,
+            text="Google Drive 檔案",
+            font=self.myfont
+        )
+        self.files_label.pack(pady=10)
+
+        # 使用傳統的 Treeview 來顯示檔案列表
+        self.files_tree = Treeview(
+            self.right_frame,
+            columns=("name",),
+            show="headings",
+            height=15
+        )
+        self.files_tree.heading("name", text="檔案名稱")
+        self.files_tree.pack(pady=10, padx=10, fill="both", expand=True)
+
+        # 更新檔案列表按鈕
+        self.refresh_button = ctk.CTkButton(
+            master=self.right_frame,
+            text="更新檔案列表",
+            command=self.refresh_file_list,
+            state="disabled",
+            font=self.myfont
+        )
+        self.refresh_button.pack(pady=10)
+
+        # 結果 Label
+        self.result_label = ctk.CTkLabel(
+            self.left_frame,
+            text="",
+            text_color="blue",
+            font=self.myfont
+        )
+        self.result_label.pack(pady=10)
+
+        # 進度條
+        self.progress = Progressbar(
+            self.left_frame,
+            orient="horizontal",
+            length=300,
+            mode="indeterminate"
+        )
+
+        # 保存目前圖片
+        self.current_image = None
+        self.current_image_path = None
+
+        # 綁定檔案列表的雙擊事件
+        self.files_tree.bind("<Double-1>", self.on_file_double_click)
+
+    def connect_to_drive(self):
+        """連接到 Google Drive"""
+        try:
+            # 刪除現有的 token 文件（如果存在）
+            if os.path.exists(TOKEN_PATH):
+                os.remove(TOKEN_PATH)
+
+            # 強制重新認證
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_PATH,
+                SCOPES,
+                # 設置 redirect_uri 為本地伺服器
+                redirect_uri='http://localhost:0'
+            )
+
+            # 設置額外參數以強制顯示帳號選擇器
+            creds = flow.run_local_server(
+                port=0,
+                authorization_prompt_message='請在瀏覽器中選擇您的 Google 帳號',
+                open_browser=True,
+                # 添加額外參數強制顯示帳號選擇器
+                authorization_url_kwargs={
+                    'prompt': 'select_account consent',
+                    'access_type': 'offline'
+                }
+            )
+
+            # 儲存新的認證（可選）
+            with open(TOKEN_PATH, 'w') as token:
+                token.write(creds.to_json())
+
+            self.drive_service = build('drive', 'v3', credentials=creds)
+            self.upload_drive_button.configure(state="normal")
+            self.refresh_button.configure(state="normal")
+            self.refresh_file_list()
+            messagebox.showinfo("成功", "已成功連接到 Google Drive！")
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"連接 Google Drive 時發生錯誤：{str(e)}")
+
+    def refresh_file_list(self):
+        """更新 Google Drive 檔案列表"""
+        if not self.drive_service:
+            return
+
+        # 清除現有列表
+        for item in self.files_tree.get_children():
+            self.files_tree.delete(item)
+
+        try:
+            # 只列出圖片檔案
+            results = self.drive_service.files().list(
+                q="mimeType contains 'image/'",
+                fields="files(id, name)"
+            ).execute()
+            files = results.get('files', [])
+
+            for file in files:
+                self.files_tree.insert('', 'end', values=(file['name'],), iid=file['id'])
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"讀取檔案列表時發生錯誤：{str(e)}")
+
+    def on_file_double_click(self, event):
+        """處理檔案列表的雙擊事件"""
+        selected_item = self.files_tree.selection()
+        if not selected_item:
+            return
+
+        file_id = selected_item[0]
+        self.download_and_process_file(file_id)
+
+    def download_and_process_file(self, file_id):
+        """下載並處理 Google Drive 上的檔案"""
+        try:
+            # 獲取檔案資訊
+            file_metadata = self.drive_service.files().get(fileId=file_id).execute()
+            file_name = file_metadata['name']
+
+            # 下載檔案
+            request = self.drive_service.files().get_media(fileId=file_id)
+            file_handle = io.BytesIO()
+            downloader = MediaIoBaseDownload(file_handle, request)
+            done = False
+
+            self.progress.pack(pady=10)
+            self.progress.start()
+
+            while not done:
+                _, done = downloader.next_chunk()
+
+            # 將檔案保存到臨時目錄
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, file_name)
+
+            with open(temp_path, 'wb') as f:
+                f.write(file_handle.getvalue())
+
+            # 顯示圖片
+            img = ctk.CTkImage(
+                light_image=Image.open(temp_path),
+                dark_image=Image.open(temp_path),
+                size=(400, 300)
+            )
+
+            self.image_label.configure(image=img, text="")
+            self.current_image = img
+            self.current_image_path = temp_path
+
+            # 進行人臉辨識
+            self.recognize_face(temp_path)
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"處理檔案時發生錯誤：{str(e)}")
+            self.progress.stop()
+            self.progress.pack_forget()
+
+    def upload_image(self):
+        """用戶上傳圖片並執行人臉辨識"""
+        file_path = filedialog.askopenfilename(
+            title="選擇圖片",
+            filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")]
+        )
+
+        if file_path:
+            try:
+                self.progress.pack(pady=10)
+                self.progress.start()
+
+                img = ctk.CTkImage(
+                    light_image=Image.open(file_path),
+                    dark_image=Image.open(file_path),
+                    size=(400, 300)
+                )
+
+                self.image_label.configure(image=img, text="")
+                self.current_image = img
+                self.current_image_path = file_path
+
+                confirm = messagebox.askyesno("確認", "是否要繼續進行人臉辨識？")
+                if confirm:
+                    self.root.after(1000, lambda: self.recognize_face(file_path))
+                else:
+                    self.result_label.configure(text="已取消人臉辨識。")
+                    self.progress.stop()
+                    self.progress.pack_forget()
+
+            except Exception as e:
+                messagebox.showerror("錯誤", f"處理圖片時發生錯誤：{e}")
+                self.progress.stop()
+                self.progress.pack_forget()
+
+    def upload_to_drive(self):
+        """上傳圖片至 Google Drive"""
+        if not self.current_image_path:
+            messagebox.showwarning("警告", "請先選擇要上傳的圖片！")
+            return
+
+        try:
+            file_metadata = {'name': os.path.basename(self.current_image_path)}
+            media = MediaFileUpload(
+                self.current_image_path,
+                mimetype='image/jpeg',
+                resumable=True
+            )
+
+            file = self.drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+
+            messagebox.showinfo("成功", f"檔案已成功上傳至 Google Drive！\n檔案ID: {file.get('id')}")
+            self.refresh_file_list()  # 更新檔案列表
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"上傳至 Google Drive 時發生錯誤：{str(e)}")
+
+    def recognize_face(self, file_path):
+        """模擬辨識過程"""
+        try:
+            match = self.face_db.find_matching_face(file_path) if self.face_db else None
+
+            if match:
+                self.result_label.configure(
+                    text=f"找到相似人臉: {match['name']}\n相似度: {match['similarity']:.4f}"
+                )
+            else:
+                self.result_label.configure(text="未找到匹配人臉")
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"辨識過程中發生錯誤：{e}")
+
+        finally:
+            self.progress.stop()
+            self.progress.pack_forget()
+
+    def reset(self):
+        """重置介面"""
+        self.image_label.configure(image=None, text="(上傳圖片會顯示在此處)")
+        self.current_image = None
+        self.current_image_path = None
+        self.result_label.configure(text="")
+        self.progress.pack_forget()
+
+
+def main():
+    root = ctk.CTk()
+    face_db = None  # 用你的實際類或對象替代
+    app = FaceRecognitionApp(root, face_db)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
