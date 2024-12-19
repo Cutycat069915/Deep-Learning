@@ -3,6 +3,7 @@ import numpy as np
 import mysql.connector
 import keras.models
 from Data_preprocess import preprocess_image
+from tkinter import Tk, Label, Button, filedialog, messagebox
 
 
 class FaceRecognitionDatabase:
@@ -43,7 +44,7 @@ class FaceRecognitionDatabase:
         ''', (name, embedding_bytes, image_path))
         self.conn.commit()
 
-    def find_matching_face(self, input_image_path, threshold=0.7):
+    def find_matching_face(self, input_image_path, threshold=0.6):
         """在資料庫中尋找相似人臉"""
         input_embedding = self.generate_embedding(input_image_path)
 
@@ -78,6 +79,43 @@ class FaceRecognitionDatabase:
         self.conn.close()
 
 
+class FaceRecognitionApp:
+    def __init__(self, root, face_db):
+        self.root = root
+        self.face_db = face_db
+        self.root.title("人臉辨識系統")
+
+        # 介面元件
+        self.label = Label(root, text="上傳圖片以進行辨識")
+        self.label.pack(pady=20)
+
+        self.upload_button = Button(root, text="上傳圖片", command=self.upload_image)
+        self.upload_button.pack(pady=10)
+
+        self.result_label = Label(root, text="", fg="blue")
+        self.result_label.pack(pady=20)
+
+    def upload_image(self):
+        """用戶上傳圖片並執行人臉辨識"""
+        file_path = filedialog.askopenfilename(
+            title="選擇圖片",
+            filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")]
+        )
+
+        if file_path:
+            try:
+                match = self.face_db.find_matching_face(file_path)
+
+                if match:
+                    self.result_label.config(
+                        text=f"找到相似人臉: {match['name']}\n相似度: {match['similarity']:.4f}"
+                    )
+                else:
+                    self.result_label.config(text="未找到匹配人臉")
+            except Exception as e:
+                messagebox.showerror("錯誤", f"處理圖片時發生錯誤：{e}")
+
+
 def main():
     # 配置
     model_path = r"C:\Users\User\PycharmProjects\Face\Project\Final Project\face_recognition_models\refined_embedding_model.h5"
@@ -88,33 +126,20 @@ def main():
         'database': 'face_recognition_db'
     }
 
-    # 初始化
+    # 初始化資料庫
     face_db = FaceRecognitionDatabase(model_path, db_config)
 
     try:
-        # 範例：存儲新人臉
-        face_db.store_face_embedding('chaewon', 'D:/Desktop/Pic/data/anchor05.jpg')
-
-        # 範例：識別人臉
-        match = face_db.find_matching_face('D:/Desktop/Pic/data/anchor07.jpg')
-
-        if match:
-            print(f"找到相似人臉: {match['name']}")
-            print(f"相似度: {match['similarity']:.4f}")
-        else:
-            print("未找到匹配人臉")
-
+        # 啟動GUI
+        root = Tk()
+        app = FaceRecognitionApp(root, face_db)
+        root.mainloop()
     finally:
         face_db.close_connection()
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 
 
